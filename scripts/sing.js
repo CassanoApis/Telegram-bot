@@ -1,93 +1,121 @@
-const fs = require("fs-extra");
 const axios = require("axios");
-const ytdl = require("@neoxr/ytdl-core");
+const fs = require("fs-extra");
 const yts = require("yt-search");
-const { shorten } = require('tinyurl');
+const path = require("path");
+
+const cacheDir = path.join(__dirname, "/cache");
+fs.ensureDirSync(cacheDir); // Ensure cache directory exists
 
 module.exports = {
     config: {
         name: "sing",
-        version: "1.0",
-        author: "JARiF",
-        category: "MEDIA",
+        version: "1.2",
+        author: "Team Calyx",
+        category: "media",
         role: 0,
     },
-    annieStart: async function({ bot, msg, match }) {
+
+    annieStart: async function ({ bot, msg }) {
         try {
-            let songName;
-            const replyToMessage = msg.reply_to_message;
-
-            if (replyToMessage && (replyToMessage.audio || replyToMessage.video)) {
-                let attachmentUrl;
-                if (replyToMessage.audio) {
-                    attachmentUrl = await bot.getFileLink(replyToMessage.audio.file_id);
-                } else {
-                    attachmentUrl = await bot.getFileLink(replyToMessage.video.file_id);
-                }
-                const shortUrl = await shorten(attachmentUrl);
-                const response = await axios.get(`https://www.api.vyturex.com/songr?url=${shortUrl}`);
-                songName = response.data.title;
-
-                if (!songName) {
-                    await bot.sendMessage(msg.chat.id, "Error: Failed to get song name from the provided file.");
-                    return;
-                }
-            } else {
-                songName = msg.text.split(' ').slice(1).join(' ');
-                if (!songName) {
-                    await bot.sendMessage(msg.chat.id, "❌ Please provide a song name or keywords to search, or reply to an audio or video file.");
-                    return;
-                }
+            const args = msg.text.split(" ").slice(1);
+            if (args.length < 1) {
+                return bot.sendMessage(msg.chat.id, "❌ Please use the format `/sing <search term>`.");
             }
 
-            const chatId = msg.chat.id;
-            const searchingMessage = await bot.sendMessage(chatId, `⏳ | Searching Music "${songName}"`);
+            const searchTerm = args.join(" ");
+            const searchingMsg = await bot.sendMessage(msg.chat.id, `⏳ Searching for "${searchTerm}"...`);
 
-            const searchResults = await yts(songName);
-            if (!searchResults.videos.length) {
-                await bot.sendMessage(chatId, "Error: No search results found.");
-                await bot.deleteMessage(chatId, searchingMessage.message_id);
+            const searchResults = await yts(searchTerm);
+            const topVideo = searchResults.videos[0];
+
+            if (!topVideo) {
+                await bot.editMessageText("❌ No results found.", {
+                    chat_id: msg.chat.id,
+                    message_id: searchingMsg.message_id
+                });
                 return;
             }
 
-            const video = searchResults.videos[0];
-            const videoUrl = video.url;
+            const videoUrl = topVideo.url;
+            const downloadUrlEndpoint = `http://152.42.220.111:25744/allLink?link=${encodeURIComponent(videoUrl)}`;
+            const respo = await axios.get(downloadUrlEndpoint);
+            const downloadUrl = respo.data.download_url;
 
-            const stream = ytdl(videoUrl, { filter: "audioonly" });
-            const fileName = `${video.title}.mp3`;
-            const filePath = `./scripts/tmp/${fileName}`;
+            if (!downloadUrl) {
+                await bot.editMessageText("❌ Could not retrieve an MP3 file. Try another search.", {
+                    chat_id: msg.chat.id,
+                    message_id: searchingMsg.message_id
+                });
+                return;
+            }
 
-            const writeStream = fs.createWriteStream(filePath);
-            stream.pipe(writeStream);
+            const totalSize = await getTotalSize(downloadUrl);
+            const audioPath = path.join(cacheDir, `ytb_audio_${topVideo.videoId}.mp3`);
+            await downloadFileParallel(downloadUrl, audioPath, totalSize, 5);
 
-            writeStream.on('finish', async () => {
-                console.info('[DOWNLOADER] Downloaded');
+            const audioStat = await fs.stat(audioPath);
+            if (audioStat.size > 26214400) {
+                await bot.sendMessage(msg.chat.id, "❌ File is too large to send (> 25MB).");
+                await fs.unlink(audioPath);
+                return;
+            }
 
-                if (fs.statSync(filePath).size > 26214400) {
-                    fs.unlinkSync(filePath);
-                    await bot.sendMessage(chatId, '[ERR] The file could not be sent because it is larger than 25MB.');
-                } else {
-                    const caption = `Title: ${video.title}\nArtist: ${video.author.name}`;
-                    const audio = fs.createReadStream(filePath);
-
-                    await bot.sendAudio(chatId, audio, { caption });
-                }
-
-                writeStream.close();
-
-                await bot.deleteMessage(chatId, searchingMessage.message_id);
+            const caption = `📥 Audio downloaded:\n• Title: ${topVideo.title}\n• Channel: ${topVideo.author.name}`;
+            await bot.sendAudio(msg.chat.id, fs.createReadStream(audioPath), {
+                caption
             });
 
-            writeStream.on('error', async (error) => {
-                console.error('[WRITE STREAM ERROR]', error);
-                await bot.sendMessage(chatId, '[ERR] Failed to write audio file.');
-                await bot.deleteMessage(chatId, searchingMessage.message_id);
-            });
-
+            await fs.unlink(audioPath);
+            await bot.deleteMessage(msg.chat.id, searchingMsg.message_id);
         } catch (error) {
-            console.error('[ERROR]', error);
-            await bot.sendMessage(msg.chat.id, 'Error');
+            console.error("[ERROR]", error);
+            await bot.sendMessage(msg.chat.id, "❌ Failed to process your request.");
         }
     }
+};
+
+async function getTotalSize(url) {
+    const response = await axios.head(url);
+    return parseInt(response.headers["content-length"], 10);
 }
 
+async function downloadFileParallel(url, filePath, totalSize, numChunks) {
+    const chunkSize = Math.ceil(totalSize / numChunks);
+    const chunks = [];
+    const progress = Array(numChunks).fill(0);
+
+    async function downloadChunk(url, start, end, index) {
+        try {
+            const response = await axios.get(url, {
+                headers: { Range: `bytes=${start}-${end}` },
+                responseType: "arraybuffer",
+                timeout: 15000,
+            });
+            progress[index] = response.data.byteLength;
+            return response.data;
+        } catch (error) {
+            throw error;
+        }
+    }
+
+    for (let i = 0; i < numChunks; i++) {
+        const start = i * chunkSize;
+        const end = Math.min(start + chunkSize - 1, totalSize - 1);
+        chunks.push(downloadChunk(url, start, end, i));
+    }
+
+    try {
+        const buffers = await Promise.all(chunks);
+        const fileStream = fs.createWriteStream(filePath);
+        for (const buffer of buffers) {
+            fileStream.write(Buffer.from(buffer));
+        }
+        await new Promise((resolve, reject) => {
+            fileStream.on("finish", resolve);
+            fileStream.on("error", reject);
+            fileStream.end();
+        });
+    } catch (error) {
+        console.error("Error downloading or writing the file:", error);
+    }
+                    }
